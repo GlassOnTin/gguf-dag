@@ -90,7 +90,9 @@ def main(argv=None):
                 size = man["source"]["size"]
                 nu = man["chunks"]["new_unique_bytes"]
                 total = man["chunks"]["count"]
-                hit = 1 - nu / size if size else 1.0
+                # the header region is stored verbatim, never chunked
+                payload = size - man["header"]["raw_bytes"]
+                hit = 1 - nu / payload if payload > 0 else 1.0
                 print(f"{label}: {size / 2**30:.2f} GiB, {total} chunks, "
                       f"new {nu / 2**30:.2f} GiB, shared-chunk hit {hit * 100:.2f}% "
                       f"([{time.time() - t0:.1f}s] id {man['id'][:12]})")
