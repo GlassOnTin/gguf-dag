@@ -76,10 +76,43 @@ round-trip byte-identically, and the spans agree with `gguf-py`'s
   manifest instead of re-reading. Cost stays in the load phase; llama.cpp
   dequantizes quantized blocks in registers/L2 anyway, so chunk-level
   indirection never touches the compute path.
-- Cross-instance VRAM sharing via CUDA IPC: identical chunk digests map to one
-  per-instance allocation, with chunks batched into arena blobs to amortize
-  IPC handle counts. The storage identity this repo supplies is the consumer's
-  prerequisite.
+
+## CUDA IPC prototype
+
+`ipc/` (not installed by `pip`, build with `make -C ipc`, needs nvcc) is a
+working proof of the cross-instance VRAM sharing designed around this store.
+A `plan.py` pass reads two manifests from a store and writes a chunk plan:
+which chunks the publisher places in device arenas and which digests the
+consumer can expect to find already resident. `agent.cu` runs the two sides:
+
+- **publish** — copies listed chunks from `chunks.pack` (mmap'd) into
+  exact-size device arenas, exports one `cudaIpcMemHandle_t` per arena plus a
+  digest → (arena, offset) map, waits for the consumer.
+- **consume** — opens the published arenas via IPC, privately copies only
+  chunks it cannot attach, then verifies *every* chunk two ways: host sha256
+  of a D2H read, and a device-side reduction (byte sum + byte xor) against
+  fingerprints that came with the plan. Shared chunks are verified through
+  the attached pages.
+
+Measured on 2× 32 GiB RTX 5090, driver 595.84, chunks from the demo store:
+
+| case | publisher | consumer attach | consumer own VRAM | verify |
+|---|---|---|---|---|
+| same file twice | 2490 MiB, 3 arenas, copy 1.3 s | 2490 MiB, 0.014 s | **70 MiB** | 39865/39865 sha + device, fails 0 |
+| Q8_0 ↔ Q4_K_M | 3935 MiB, 4 arenas, copy 2.1 s | 860 MiB shared | 1706 MiB (1630 MiB unique copied, 0.84 s) | 39865/39865, fails 0 |
+
+The consumer's own VRAM bound is read in-process via `cudaMemGetInfo` deltas,
+which is the honest number: a second instance of a fully-shared model holds
+its context plus one 64 MiB marker, and a Q4 consumer next to its Q8 sibling
+holds 69% of its own bytes instead of 100%. `demo.py` asserts those bounds and
+the two-way verification.
+
+One driver caveat found while measuring: `nvidia-smi` totals are accurate
+while these processes run (`utilization > 0`) and collapse once they sit idle
+holding allocated memory (3–500 MiB reported for 3.5 GiB actually resident,
+per-pid and per-GPU totals disagreeing with each other). Reproduced across
+runs on 595.84; the demo therefore samples peak totals during the active
+verify window and treats idle-phase NVML output as telemetry, not evidence.
 
 ## Limits
 
