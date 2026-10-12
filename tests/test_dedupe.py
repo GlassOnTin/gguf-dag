@@ -110,6 +110,7 @@ class PlanTests(unittest.TestCase):
 
     def tearDown(self):
         self.st.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _mk(self, name, payloads):
         tensors = [(f"t{i}", [n // 64, 64], 0, p) for i, (n, p) in enumerate(payloads)]
