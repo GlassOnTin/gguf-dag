@@ -33,6 +33,10 @@ _SCALAR_FMT = {
 }
 _SCALAR_SZ = {k: struct.calcsize("<" + f) for k, f in _SCALAR_FMT.items()}
 
+_MAX_KLEN = 1 << 20   # metadata keys and tensor names; real ones are far shorter
+_MAX_NEED = 1 << 26   # no single refill may fetch more than 64 MiB
+_RETRIES = 1 << 16    # per-construct refill attempts before declaring corruption
+
 
 class GGUFError(ValueError):
     pass
@@ -57,9 +61,24 @@ class GGUFFile:
 
     def _parse(self):
         buf = bytearray()
+        off = 24
 
         def need(n):
-            buf.extend(self._fh.read(max(int(n), 1 << 16)))
+            """Extend buf by at least n bytes (always reading 64 KiB chunks).
+
+            Returns False only on end-of-file.  n beyond _MAX_NEED means a
+            length field was misread and the cursor has desynced from the
+            file: refuse rather than allocate a file-sized buffer (this used
+            to read ~file_size bytes in one call from a jumped offset).
+            """
+            n = int(n)
+            if n > _MAX_NEED:
+                raise GGUFError(
+                    f"{self.path}: header parse wants {n} more bytes at offset {off}; "
+                    "the file is corrupt or the parser desynced")
+            got = self._fh.read(max(n, 1 << 16))
+            buf.extend(got)
+            return bool(got)
 
         self._fh = open(self.path, "rb")
         try:
@@ -69,46 +88,74 @@ class GGUFFile:
             self.version, n_tensors, n_kv = struct.unpack_from("<IQQ", buf, 4)
             if self.version not in (2, 3):
                 raise GGUFError(f"{self.path}: unsupported GGUF version {self.version}")
-            off = 24
             while n_kv:
                 while len(buf) - off < 12:
-                    need(12 - (len(buf) - off))
+                    if not need(12 - (len(buf) - off)):
+                        raise GGUFError(f"{self.path}: unexpected EOF in metadata keys at offset {off}")
                 (klen,) = struct.unpack_from("<Q", buf, off)
+                if klen > _MAX_KLEN:
+                    raise GGUFError(
+                        f"{self.path}: metadata key length {klen} at offset {off} "
+                        f"exceeds {_MAX_KLEN}")
                 off += 8
                 while len(buf) - off < klen + 4:
-                    need(klen + 4 - (len(buf) - off))
+                    if not need(klen + 4 - (len(buf) - off)):
+                        raise GGUFError(f"{self.path}: unexpected EOF in metadata at offset {off}")
                 key = bytes(buf[off:off + klen]).decode("utf-8", "replace")
                 off += klen
                 (vt,) = struct.unpack_from("<I", buf, off)
                 off += 4
-                while True:
+                # _value_end is side-effect-free, so retries restart safely.
+                for _ in range(_RETRIES):
                     try:
-                        end = self._value_end(buf, off, vt)
+                        end = self._value_end(buf, off, vt, self.file_size)
                         break
                     except (struct.error, IndexError):
-                        need(1 << 16)
+                        if not need(1 << 16):
+                            raise GGUFError(
+                                f"{self.path}: unexpected EOF in value of '{key}' at offset {off}")
+                else:
+                    raise GGUFError(f"{self.path}: value of '{key}' at offset {off} did not resolve")
                 if key == "general.alignment" and vt == VT_U32:
                     (self.alignment,) = struct.unpack_from("<I", buf, off)
                 off = end
                 n_kv -= 1
             infos = []
+            # Parse each tensor info through a local cursor and commit only on
+            # success: any mid-body failure (e.g. a length field spanning the
+            # buffered boundary) must retry from the loop's own start offset,
+            # never from whatever `off` got advanced to.
             for _ in range(n_tensors):
-                while True:
+                for _ in range(_RETRIES):
                     try:
-                        name, off = self._read_str(buf, off)
-                        (nd,) = struct.unpack_from("<I", buf, off)
-                        off += 4
-                        if len(buf) - off < 8 * nd + 12:
-                            need(8 * nd + 12 - (len(buf) - off))
-                        dims = struct.unpack_from("<" + "Q" * nd, buf, off)
-                        off += 8 * nd
-                        ttype, toff = struct.unpack_from("<IQ", buf, off)
-                        off += 12
+                        o = off
+                        name, o = self._read_str(buf, o)
+                        (nd,) = struct.unpack_from("<I", buf, o)
+                        if nd > 32:
+                            raise GGUFError(
+                                f"{self.path}: tensor '{name}' has nd {nd} at offset {o}; "
+                                f"GGML tensors have at most a few dimensions")
+                        o += 4
+                        if len(buf) - o < 8 * nd + 12:
+                            if not need(8 * nd + 12 - (len(buf) - o)):
+                                raise GGUFError(f"{self.path}: unexpected EOF at offset {o}")
+                        dims = struct.unpack_from("<" + "Q" * nd, buf, o)
+                        o += 8 * nd
+                        ttype, toff = struct.unpack_from("<IQ", buf, o)
+                        o += 12
+                        off = o
                         break
                     except (struct.error, IndexError):
-                        need(1 << 16)
+                        if not need(1 << 16):
+                            raise GGUFError(f"{self.path}: unexpected EOF at offset {off}")
+                else:
+                    raise GGUFError(
+                        f"{self.path}: tensor info at offset {off} did not resolve after {_RETRIES} refills")
                 infos.append((name, list(dims), ttype, toff))
             self.data_start = align_up(off, self.alignment)
+            while len(buf) < self.data_start:
+                if not need(self.data_start - len(buf)):
+                    raise GGUFError(f"{self.path}: unexpected EOF before the data section")
             if self.data_start > self.file_size:
                 raise GGUFError(
                     f"{self.path}: header/pad ends at {self.data_start} beyond file size {self.file_size}")
@@ -135,23 +182,36 @@ class GGUFFile:
 
     def _read_str(self, buf, off):
         (n,) = struct.unpack_from("<Q", buf, off)
+        if n > _MAX_KLEN:
+            raise GGUFError(f"string length {n} at offset {off} exceeds {_MAX_KLEN}")
+        if len(buf) - off - 8 < n:
+            raise struct.error("string not yet buffered")
         return bytes(buf[off + 8: off + 8 + n]).decode("utf-8", "replace"), off + 8 + n
 
     @staticmethod
-    def _value_end(buf, off, vt):
+    def _value_end(buf, off, vt, fsize):
+        """End offset of a metadata value; every extent checked against fsize."""
         if vt in _SCALAR_SZ:
             return off + _SCALAR_SZ[vt]
         if vt == VT_STRING:
             (n,) = struct.unpack_from("<Q", buf, off)
+            if off + 8 + n > fsize:
+                raise GGUFError(f"string value of {n} bytes at offset {off} exceeds file size")
             return off + 8 + n
         if vt == VT_ARRAY:
             et, cnt = struct.unpack_from("<IQ", buf, off)
             off += 12
             if et in _SCALAR_SZ:
+                if off + _SCALAR_SZ[et] * cnt > fsize:
+                    raise GGUFError(f"{cnt}-element array at offset {off} exceeds file size")
                 return off + _SCALAR_SZ[et] * cnt
             if et == VT_STRING:
                 for _ in range(cnt):
                     (n,) = struct.unpack_from("<Q", buf, off)
+                    if off + 8 + n > fsize:
+                        raise GGUFError(f"string of {n} bytes at offset {off} exceeds file size")
+                    if len(buf) - off - 8 < n:
+                        raise struct.error("string array not yet buffered")
                     off += 8 + n
                 return off
             raise GGUFError(f"unsupported nested array element type {et}")
