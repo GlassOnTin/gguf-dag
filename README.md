@@ -35,6 +35,10 @@ gguf-dag --store ./store ls <id-prefix>
 gguf-dag --store ./store verify all
 gguf-dag --store ./store rebuild <id-prefix> -o rebuilt.gguf
 gguf-dag --store ./store stats
+
+# manifest-guided in-place dedupe (see "Disk savings" below)
+gguf-dag --store ./store dedupe --dry-run /models/
+gguf-dag --store ./store dedupe /models/
 ```
 
 Byte-identity check after a rebuild:
@@ -68,6 +72,39 @@ tensor *N+1*'s offset (last one to EOF), so padding and new quant types need no
 code change. Test files with junk between tensors and after the last tensor
 round-trip byte-identically, and the spans agree with `gguf-py`'s
 `t.n_bytes` on every tensor of three real files.
+
+## Disk savings: the store vs in-place FIDEDUPERANGE
+
+Measured on the full zoo: 14 files, 488.26 GiB, five model families
+(Qwen3.8-Flash-Next base shards, an MTP-merged build of them, MTP/mmproj
+sidecars, MiMo-V2.6-Flash MXFP4 MoE, and a fine-tune).
+
+- Store import: **378.98 GiB unique pack, 22.4% of the corpus saved**. The
+  109 GiB cross-file duplicate estimate from the survey landed exactly.
+  Index overhead is 0.05% of the pack (6.2M chunk records), and `verify all`
+  re-hashed all 6,211,207 chunks with zero mismatches.
+- Shard recombination is total: the MTP-merged file's 1,728,139 chunks all
+  resolve from other manifests; importing it costs zero new bytes. Within a
+  shard group 98.3% of chunks repeat; quant-family pairs (Q8_0 ↔ Q4_K_M)
+  share 21.9%; the fine-tune shares 0.27% with its base, i.e. nothing above
+  the quant-noise floor.
+
+`gguf-dag dedupe` can apply this sharing on the original files with
+FIDEDUPERANGE, guided by manifests. On the same zoo it plans **0.00 GiB of
+111.46 GiB of demonstrably shared content**. The syscall requires both window
+offsets and content-shift congruent mod 4096; GGUF's 32-byte tensor alignment
+makes the per-pair delta effectively random modulo 4096, and the large pairs
+are one contiguous run each (up to 46.4 GiB) with a single delta, so each pair
+is one coin flip out of 128 — twelve pairs, twelve misses (measured deltas
+1472–3968, all ≢ 0). duperemove over the same tree had earlier recovered only
+0.2 GiB for the same reason. The space is real but not reachable in place;
+the store captures all of it by construction.
+
+The dedupe driver stays: its round-trip tests document the ioctl plumbing
+(FIDEDUPERANGE is `_IOWR(0x94, 54, struct file_dedupe_range)`) and prove
+sharing physically via FIEMAP extents, which was the only way to see that XFS
+reports a repeat dedupe of already-shared ranges as status 0, not
+`FILE_DEDUPE_RANGE_SAME`.
 
 ## Designed for (not implemented here)
 
@@ -124,8 +161,15 @@ verify window and treats idle-phase NVML output as telemetry, not evidence.
   re-quantization that reproduces byte-identical blocks (as merged shard
   groups did here, 98.3%) is detected.
 - GGUF v2/v3 only; no nested-array KV parsing.
-- Corpus tested: BF16, Q4_K_XL, Q4_K_M, Q8_0, MTP, mmproj files. No Q2-tier or
-  IQ-tier files exercised (none in my corpus).
+- The header parser is bounded against corrupt or hostile headers: keys and
+  names ≤ 1 MiB, any single refill ≤ 64 MiB, string/array extents checked
+  against the file size, and tensor infos parse through a cursor committed
+  only on success — a mid-entry desync raises a GGUFError naming the offset
+  instead of allocating a file-sized buffer (the 105 GiB balloon that
+  motivated this ran at 94% CPU on the retry storm after one near-file-size
+  read). Parsing a 105 GiB file: 1.7 s, 43 MiB peak RSS.
+- Corpus tested: BF16, Q4_K_XL, Q4_K_M, Q8_0, MXFP4-MoE, MTP, mmproj files.
+  No Q2-tier or IQ-tier files exercised (none in my corpus).
 
 ## License
 
