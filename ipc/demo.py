@@ -8,7 +8,6 @@ memory -> assert verification and VRAM accounting.
 
 import argparse
 import os
-import signal
 import subprocess
 import sys
 import time
@@ -106,46 +105,59 @@ def main():
     pub = subprocess.Popen(
         [str(HERE / "agent"), "publish", str(plan), str(pub_out), str(con_out)],
         env=env, stderr=pub_err, text=True)
+    con = None
+    con_err = None
     try:
-        wait_for(pub_out, "READY", 300)
-    except TimeoutError:
-        pub_err.close()
-        pub.kill()
-        err = (wd / "pub.err").read_text()
-        print(f"publisher timed out; stderr:\n{err[-2000:]}")
-        out = pub_out.read_text() if pub_out.exists() else ""
-        print(f"pub.out had {len(out)} bytes, ends: ...{out[-200:]}")
-        raise
+        try:
+            wait_for(pub_out, "READY", 300)
+        except TimeoutError:
+            err = (wd / "pub.err").read_text()
+            print(f"publisher timed out; stderr:\n{err[-2000:]}")
+            out = pub_out.read_text() if pub_out.exists() else ""
+            print(f"pub.out had {len(out)} bytes, ends: ...{out[-200:]}")
+            raise
 
-    print("== launch consumer (holds VRAM for snapshot) ==")
-    con_err = open(wd / "con.err", "w")
-    con = subprocess.Popen(
-        [str(HERE / "agent"), "consume", str(plan), str(pub_out), str(con_out),
-         str(args.hold)],
-        env=env, stderr=con_err, text=True)
-    # Sample the GPU total while con is active (attach/copy/verify are still
-    # running).  NVML is consistent during activity; once agents idle at
-    # HOLDING its totals collapse to ~3 MiB while per-pid ctx rows persist —
-    # a driver accounting artifact, reproduced across runs, so we do not
-    # assert on idle-phase NVML.
-    gpu_idx = int(args.gpu)
-    gpu_max = 0
-    for _ in range(12):
-        gpus_used = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader"],
-            capture_output=True, text=True).stdout.strip().splitlines()
-        if len(gpus_used) > gpu_idx:
-            gpu_max = max(gpu_max, int(gpus_used[gpu_idx].split()[0]))
-        time.sleep(0.7)
-        if con_out.exists() and "HOLDING" in con_out.read_text(errors="replace"):
-            break
-    holding = nvidia_mem()
-    rc_con = con.wait(timeout=180)
-    con_err.close()
-    wait_for(con_out, "CONSUMER_DONE", 30)
-    pub.send_signal(signal.SIGTERM)
-    pub.wait(timeout=120)
-    pub_err.close()
+        print("== launch consumer (holds VRAM for snapshot) ==")
+        con_err = open(wd / "con.err", "w")
+        con = subprocess.Popen(
+            [str(HERE / "agent"), "consume", str(plan), str(pub_out), str(con_out),
+             str(args.hold)],
+            env=env, stderr=con_err, text=True)
+        # Sample the GPU total while con is active (attach/copy/verify are still
+        # running).  NVML is consistent during activity; once agents idle at
+        # HOLDING its totals collapse to ~3 MiB while per-pid ctx rows persist —
+        # a driver accounting artifact, reproduced across runs, so we do not
+        # assert on idle-phase NVML.
+        gpu_idx = int(args.gpu)
+        gpu_max = 0
+        for _ in range(12):
+            gpus_used = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader"],
+                capture_output=True, text=True).stdout.strip().splitlines()
+            if len(gpus_used) > gpu_idx:
+                gpu_max = max(gpu_max, int(gpus_used[gpu_idx].split()[0]))
+            time.sleep(0.7)
+            if con_out.exists() and "HOLDING" in con_out.read_text(errors="replace"):
+                break
+        holding = nvidia_mem()
+        rc_con = con.wait(timeout=180)
+        wait_for(con_out, "CONSUMER_DONE", 30)
+    finally:
+        # A dying consumer (OOM at its context init, a wait timeout, Ctrl-C)
+        # must never leak the publisher at full residency — every error path
+        # reaches here, so both agents are reaped and the handles closed.
+        for proc in (con, pub):
+            if proc is None or proc.poll() is not None:
+                continue
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=30)
+        pub_err.close()
+        if con_err is not None:
+            con_err.close()
 
     pub_s = parse_section(pub_out, "PUB_STATS")
     con_s = parse_section(con_out, "CON_STATS")
