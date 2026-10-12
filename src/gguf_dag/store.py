@@ -125,41 +125,45 @@ class Store:
 
     # -- add -----------------------------------------------------------
     def add(self, path, hmac_key=None):
-        """Split one GGUF into the store. Returns the manifest id."""
+        """Split one GGUF into the store. Returns the manifest id.
+
+        Reads chunk-by-chunk instead of mapping the file: a whole-model
+        mapping makes every resident page of a 46-111 GiB file count as this
+        process's RSS.
+        """
         gf = GGUFFile(path)
         with open(path, "rb") as f:
-            src = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-            try:
-                refs = bytearray()
-                tensors = []
-                new_chunks = new_bytes = total_chunks = 0
-                for t in gf.tensors:
-                    refs_off = len(refs)
-                    n_chunks = 0
-                    pos, end = t["start"], t["start"] + t["n_bytes"]
-                    while pos < end:
-                        ln = min(self.chunk_size, end - pos)
-                        c = src[pos:pos + ln]
-                        d = _blake(c)
-                        if self._idx_get(d) is None:
-                            # append to pack; sequential writes, no seek needed
-                            self.pack_fp.write(c)
-                            self._pending[d] = (self.pack_size, ln)
-                            self.pack_size += ln
-                            new_chunks += 1
-                            new_bytes += ln
-                        refs += d
-                        n_chunks += 1
-                        total_chunks += 1
-                        pos += ln
-                    tensors.append({
-                        "name": t["name"], "ggml_type": t["ggml_type"],
-                        "dims": t["dims"], "start": t["start"],
-                        "n_bytes": t["n_bytes"], "n_chunks": n_chunks,
-                        "refs_off": refs_off,
-                    })
-            finally:
-                src.close()
+            refs = bytearray()
+            tensors = []
+            new_chunks = new_bytes = total_chunks = 0
+            for t in gf.tensors:
+                refs_off = len(refs)
+                n_chunks = 0
+                f.seek(t["start"])
+                left = t["n_bytes"]
+                while left > 0:
+                    ln = min(self.chunk_size, left)
+                    c = f.read(ln)
+                    if len(c) != ln:
+                        raise GGUFError(f"short read in tensor '{t['name']}'")
+                    d = _blake(c)
+                    if self._idx_get(d) is None:
+                        # append to pack; sequential writes, no seek needed
+                        self.pack_fp.write(c)
+                        self._pending[d] = (self.pack_size, ln)
+                        self.pack_size += ln
+                        new_chunks += 1
+                        new_bytes += ln
+                    refs += d
+                    n_chunks += 1
+                    total_chunks += 1
+                    left -= ln
+                tensors.append({
+                    "name": t["name"], "ggml_type": t["ggml_type"],
+                    "dims": t["dims"], "start": t["start"],
+                    "n_bytes": t["n_bytes"], "n_chunks": n_chunks,
+                    "refs_off": refs_off,
+                })
 
         self.pack_fp.flush()
         os.fsync(self.pack_fp.fileno())
@@ -225,7 +229,8 @@ class Store:
         mdir = self.manifest_path(ref).parent
         if self._pending:
             raise GGUFError("add incomplete")
-        pack = mmap.mmap(self.pack_fp.fileno(), 0, access=mmap.ACCESS_READ) if self.pack_size else None
+        # os.pread per chunk: mapping the whole pack would make it resident
+        pack_fd = self.pack_fp.fileno()
         refs_path = mdir / "refs.bin"
         refs = None
         if os.path.getsize(refs_path):
@@ -254,7 +259,9 @@ class Store:
                             raise GGUFError(f"chunk {d.hex()} missing from index")
                         off, ln = hit
                         take = min(ln, remaining)
-                        piece = pack[off:off + take]
+                        piece = os.pread(pack_fd, take, off)
+                        if len(piece) != take:
+                            raise GGUFError(f"chunk {d.hex()} short read from pack")
                         sha.update(piece)
                         out.write(piece)
                         remaining -= take
@@ -263,8 +270,6 @@ class Store:
             if os.path.getsize(out_path) != man["source"]["size"]:
                 raise GGUFError("rebuilt file size differs from manifest")
         finally:
-            if pack is not None:
-                pack.close()
             if refs is not None:
                 refs.close()
         return sha.hexdigest()
@@ -300,29 +305,27 @@ class Store:
             probs.append("refs blob hash mismatch")
         if probs:
             return 0, probs
-        pack = mmap.mmap(self.pack_fp.fileno(), 0, access=mmap.ACCESS_READ) if self.pack_size else None
+        # os.pread per chunk: mapping the whole pack would make it resident
+        pack_fd = self.pack_fp.fileno()
         n_checked = 0
-        try:
-            for t in man["tensors"]:
-                remaining = t["n_bytes"]
-                stream = refs_bytes[t["refs_off"]: t["refs_off"] + 16 * t["n_chunks"]]
-                for k in range(t["n_chunks"]):
-                    d = stream[k * 16:k * 16 + 16]
-                    hit = self._idx_get(d)
-                    if hit is None:
-                        probs.append(f"tensor '{t['name']}' refs chunk {d.hex()} absent")
-                        continue
-                    off, ln = hit
-                    take = min(ln, remaining)
-                    if _blake(pack[off:off + take], 16) != d:
-                        probs.append(f"tensor '{t['name']}' chunk {d.hex()} payload hash mismatch")
-                    n_checked += 1
-                    remaining -= take
-                if remaining:
-                    probs.append(f"tensor '{t['name']}' spans {remaining} bytes beyond its chunk list")
-        finally:
-            if pack is not None:
-                pack.close()
+        for t in man["tensors"]:
+            remaining = t["n_bytes"]
+            stream = refs_bytes[t["refs_off"]: t["refs_off"] + 16 * t["n_chunks"]]
+            for k in range(t["n_chunks"]):
+                d = stream[k * 16:k * 16 + 16]
+                hit = self._idx_get(d)
+                if hit is None:
+                    probs.append(f"tensor '{t['name']}' refs chunk {d.hex()} absent")
+                    continue
+                off, ln = hit
+                take = min(ln, remaining)
+                piece = os.pread(pack_fd, take, off)
+                if _blake(piece, 16) != d:
+                    probs.append(f"tensor '{t['name']}' chunk {d.hex()} payload hash mismatch")
+                n_checked += 1
+                remaining -= take
+            if remaining:
+                probs.append(f"tensor '{t['name']}' spans {remaining} bytes beyond its chunk list")
         return n_checked, probs
 
     # -- introspection ---------------------------------------------------

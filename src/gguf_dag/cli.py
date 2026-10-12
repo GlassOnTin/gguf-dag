@@ -8,6 +8,7 @@ import time
 
 from .gguf import GGUFError
 from . import __version__
+from .dedupe import bind_file, fideduperange, ranges_for_pair
 from .store import Store
 
 
@@ -61,6 +62,12 @@ def main(argv=None):
 
     p_sha = sub.add_parser("sha256", help="print sha256 of a file (byte-identity checks)")
     p_sha.add_argument("path")
+
+    p_ded = sub.add_parser("dedupe", help="FIDEDUPERANGE files in place, guided by their manifests")
+    p_ded.add_argument("paths", nargs="+", help=".gguf files or directories to recurse")
+    p_ded.add_argument("--dry-run", action="store_true", help="report planned sharing without applying")
+    p_ded.add_argument("--min-gib", type=float, default=0.1,
+                       help="skip pairs whose expected shared bytes are below this (GiB)")
 
     args = ap.parse_args(argv)
 
@@ -124,6 +131,69 @@ def main(argv=None):
                 dims = "x".join(str(d) for d in t["dims"])
                 print(f"  {t['name']:60s} type={t['ggml_type']:<3d} {t['n_bytes'] / 2**20:12.1f} MiB  "
                       f"{t['n_chunks']:7d} chunks  {dims}")
+        return 0
+
+    if args.cmd == "dedupe":
+        files = []
+        for p in args.paths:
+            if os.path.isdir(p):
+                for base, _, names in os.walk(p):
+                    files.extend(os.path.join(base, n) for n in sorted(names) if n.endswith(".gguf"))
+            else:
+                files.append(p)
+        files = sorted(set(files))
+        bound = []
+        with Store(args.store, args.chunk) as st:
+            for f in files:
+                man = bind_file(st, f)
+                if man is None:
+                    print(f"unbindable (no matching manifest): {f}")
+                else:
+                    bound.append((f, man))
+            if len(bound) < 2:
+                print(f"{len(bound)} bound files, need at least two")
+                return 1
+            pairs = []
+            for (fa, ma) in bound:
+                for (fb, mb) in bound:
+                    if fa >= fb:
+                        continue
+                    ranges = ranges_for_pair(st, ma, mb)
+                    shared = sum(r[2] for r in ranges)
+                    if shared >= args.min_gib * 2**30:
+                        pairs.append((shared, fa, fb, ranges))
+            pairs.sort(reverse=True)
+            planned = 0
+            for shared, fa, fb, ranges in pairs:
+                planned += shared
+                print(f"{shared / 2**30:8.2f} GiB  {os.path.basename(fb)}  <-  {os.path.basename(fa)}")
+            print(f"planned shared bytes across {len(pairs)} pairs: {planned / 2**30:.2f} GiB "
+                  f"{'(dry run)' if args.dry_run else ''}")
+            if args.dry_run:
+                return 0
+            total_applied = 0
+            notes = {}
+            for shared, fa, fb, ranges in pairs:
+                fd_a = os.open(fa, os.O_RDONLY)
+                fd_b = os.open(fb, os.O_RDONLY)
+                per_pair = 0
+                try:
+                    for off_a, off_b, ln in ranges:
+                        mapped, note = fideduperange(fd_a, off_a, fd_b, off_b, ln)
+                        per_pair += mapped
+                        if note:
+                            notes.setdefault(note, 0)
+                            notes[note] += 1
+                finally:
+                    os.close(fd_a)
+                    os.close(fd_b)
+                total_applied += per_pair
+                if int(per_pair / 2**30) or shared < per_pair:
+                    print(f"applied {per_pair / 2**30:8.2f} GiB  {os.path.basename(fb)} <- "
+                          f"{os.path.basename(fa)}")
+            print(f"applied shared bytes total: {total_applied / 2**30:.2f} GiB")
+            for note, cnt in sorted(notes.items()):
+                print(f"  note: {note} x{cnt}")
         return 0
 
     ap.error(f"unknown command {args.cmd}")
