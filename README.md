@@ -39,6 +39,11 @@ gguf-dag --store ./store stats
 # manifest-guided in-place dedupe (see "Disk savings" below)
 gguf-dag --store ./store dedupe --dry-run /models/
 gguf-dag --store ./store dedupe /models/
+
+# cross-process weight pool (see "Weight-pool sharing" below)
+gguf-dag share gen /models/qwen.gguf
+gguf-dag share status /models/qwen.gguf --share-socket /run/share/reg.sock
+gguf-dag share warm /models/qwen.gguf --share-socket /run/share/reg.sock
 ```
 
 Byte-identity check after a rebuild:
@@ -105,6 +110,46 @@ The dedupe driver stays: its round-trip tests document the ioctl plumbing
 sharing physically via FIEMAP extents, which was the only way to see that XFS
 reports a repeat dedupe of already-shared ranges as status 0, not
 `FILE_DEDUPE_RANGE_SAME`.
+
+## Weight-pool sharing
+
+`gguf-dag share` makes the input files for the cross-process weight pool in
+the llama.cpp fork vendored as `deps/llama.cpp` (branch `ipc-share-vmm`). The
+pool stores weight tensors in pinned CUDA segments between processes, keyed by
+(sha256 of the tensor payload, PCI bus id); `llama-share-registry` serves the
+keyspace over a unix socket and `llama-share-prewarm` seeds it from a manifest
+plus the GGUF, with no llama process running.
+
+    gguf-dag share gen /models/qwen.gguf        # writes qwen.gguf.share.tsv
+    gguf-dag share status /models/qwen.gguf --share-socket /run/reg.sock
+    gguf-dag share warm  /models/qwen.gguf --share-socket /run/reg.sock
+
+`status` polls one registry query per tensor per GPU and exits 0 only when
+every tensor is resident somewhere.
+
+Manifest resolution, in order:
+
+1. a manifest written by a real llama-share publish run next to the GGUF
+   (`<gguf>.share.tsv`), while its size+mtime gate still matches the file.
+   Prefer it: it records exactly the tensors llama loads, and for
+   tied-embedding models that cannot be derived structurally (qwen2.5 loads
+   `output.weight` and never touches `token_embd.weight`).
+2. the store: per-tensor digests rebuilt from the chunk stream, every chunk
+   blake2b-verified on read, cached under the content-keyed store manifest id
+   and computed once. These survive mtime churn.
+3. the GGUF file directly.
+
+Generated manifests cover every tensor in the file — one more than llama
+loads on tied-embedding models. When the duplicate payload is byte-identical
+(the qwen2.5-1.5b q8_0 file has `token_embd.weight == output.weight`, sha256
+verified) the registry keys on digest, so the extra line costs no extra pool
+memory. Payload sizes come from a ggml type table (`src/gguf_dag/ggml.py`)
+that raises on unknown types or unaligned `ne[0]` rather than guessing.
+
+`warm` runs `deps/llama.cpp/build*/bin/llama-share-prewarm` by default, or
+pass `--share-prewarm-bin`. Build the submodule with
+`cmake -S deps/llama.cpp -B deps/llama.cpp/build-cuda -DGGML_CUDA=ON`
+(targets `llama-share-prewarm`, `llama-share-registry`).
 
 ## Designed for (not implemented here)
 

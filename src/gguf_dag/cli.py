@@ -4,11 +4,16 @@ import argparse
 import hashlib
 import json
 import os
+import subprocess
 import time
+from pathlib import Path
 
 from .gguf import GGUFError
 from . import __version__
 from .dedupe import bind_file, fideduperange, ranges_for_pair
+from .share import (ShareError, RegistryClient, ensure_manifest, probe_buses,
+                    normalize_bus, store_tensor_digests, fresh_publish_manifest,
+                    parse_share_manifest, file_state, default_manifest)
 from .store import Store
 
 
@@ -33,6 +38,118 @@ def _sha256(path):
         for blk in iter(lambda: f.read(1 << 20), b""):
             h.update(blk)
     return h.hexdigest()
+
+
+def _share_manifest(args, gguf):
+    """Manifest entries for `share status`: read-only resolution.
+
+    Publish-run manifest next to the file first, then an existing generated
+    one (flagging a stale gate), then the store digest cache — computing the
+    cache is allowed but costs a full hash pass, which status notes.
+    """
+    fresh = fresh_publish_manifest(gguf)
+    if fresh is not None:
+        _t, _m, entries = parse_share_manifest(fresh)
+        return entries, f"publish-run manifest {os.path.basename(fresh)}"
+    gen = default_manifest(gguf)
+    if os.path.exists(gen):
+        total, mtime, entries = parse_share_manifest(gen)
+        note = ""
+        if (total, mtime) != file_state([gguf]):
+            note = " (stale gate: the file changed after generation)"
+        return entries, f"generated manifest {os.path.basename(gen)}{note}"
+    if os.path.exists(args.store):
+        with Store(args.store, args.chunk) as st:
+            man = bind_file(st, gguf)
+            if man is not None:
+                entries = store_tensor_digests(st, man)
+                print(f"(no manifest yet; computing store digests for {man['id'][:12]}, "
+                      "cached afterwards)")
+                return entries, f"store manifest {man['id'][:12]}"
+    raise ShareError(
+        f"no share manifest for {gguf}: none next to the file, and the file is "
+        "not in the store. Run 'gguf-dag share gen' or add it to the store first.")
+
+
+def _share_prewarm_bin(args):
+    bin_ = getattr(args, "share_prewarm_bin", None)
+    if not bin_:
+        pattern = "deps/llama.cpp/build*/bin/llama-share-prewarm"
+        bases = [Path.cwd(), Path(__file__).resolve().parents[2]]
+        for base in bases:
+            hits = sorted(base.glob(pattern))
+            if hits:
+                bin_ = str(hits[-1])
+                break
+    if not bin_ or not os.path.exists(bin_):
+        raise ShareError(
+            "llama-share-prewarm not found; build the fork submodule "
+            "(cmake -DGGML_CUDA=ON, target llama-share-prewarm) or pass "
+            "--share-prewarm-bin")
+    return bin_
+
+
+def _share_store_root(args):
+    """Store root or None (file-direct fallback), with a note on the downgrade."""
+    if os.path.isdir(args.store):
+        return args.store
+    print(f"(store {args.store} does not exist; hashing from the GGUF file directly)")
+    return None
+
+
+def _share_cmd_gen(args):
+    path, entries, source = ensure_manifest(args.ggf, _share_store_root(args),
+                                            out=args.out, force=args.force)
+    total = sum(b for _n, _d, b in entries)
+    print(f"manifest {path}: {len(entries)} tensors, {total / 2**20:.1f} MiB payload — source: {source}")
+
+
+def _share_cmd_status(args):
+    socket_path = args.share_socket or os.environ.get("GGUF_DAG_SHARE_SOCKET")
+    if not socket_path:
+        raise ShareError("no registry socket: pass --share-socket or set $GGUF_DAG_SHARE_SOCKET")
+    entries, source = _share_manifest(args, args.ggf)
+    buses = [normalize_bus(b) for b in args.share_bus] if args.share_bus else probe_buses()
+    if not buses:
+        raise ShareError("no PCI bus id: pass --share-bus (or make nvidia-smi available)")
+    client = RegistryClient(socket_path)
+    digests = [bytes.fromhex(d) for _n, d, _b in entries]
+    seg_total = 0
+    per_bus_hits = {b: 0 for b in buses}
+    hit = [False] * len(digests)
+    for i, d in enumerate(digests):
+        for b in buses:
+            s, seg, _got = client.query(d, b)
+            if s == "hit":
+                hit[i] = True
+                seg_total += seg
+                per_bus_hits[b] += 1
+    n = sum(hit)
+    print(f"{os.path.basename(args.ggf)}: {n}/{len(entries)} tensors resident "
+          f"({seg_total / 2**20:.1f} MiB of segments), manifest: {source}")
+    for b in buses:
+        print(f"  bus {b}: {per_bus_hits[b]}/{len(entries)}")
+    return 0 if n == len(entries) else 1
+
+
+def _share_cmd_warm(args):
+    socket_path = args.share_socket or os.environ.get("GGUF_DAG_SHARE_SOCKET")
+    if not socket_path:
+        raise ShareError("no registry socket: pass --share-socket or set $GGUF_DAG_SHARE_SOCKET")
+    if not os.path.exists(socket_path):
+        raise ShareError(f"registry socket {socket_path} does not exist; start llama-share-registry first")
+    prewarm = _share_prewarm_bin(args)
+    mpath = args.share_manifest
+    if mpath is None:
+        path, entries, source = ensure_manifest(args.ggf, _share_store_root(args))
+        mpath = str(path)
+        total = sum(b for _n, _d, b in entries)
+        print(f"manifest {mpath}: {len(entries)} tensors, {total / 2**20:.1f} MiB — source: {source}")
+    t0 = time.time()
+    r = subprocess.run([prewarm, socket_path, mpath, args.ggf])
+    print(f"prewarm exit {r.returncode} in {time.time() - t0:.2f}s "
+          f"({os.path.basename(args.ggf)}, socket {socket_path})")
+    return r.returncode
 
 
 def main(argv=None):
@@ -68,6 +185,25 @@ def main(argv=None):
     p_ded.add_argument("--dry-run", action="store_true", help="report planned sharing without applying")
     p_ded.add_argument("--min-gib", type=float, default=0.1,
                        help="skip pairs whose expected shared bytes are below this (GiB)")
+
+    p_share = sub.add_parser("share", help="cross-process weight pool: manifests, registry, prewarm")
+    share_sub = p_share.add_subparsers(dest="share_cmd", required=True)
+    p_sg = share_sub.add_parser("gen", help="generate a share manifest (<gguf>.share.tsv by default)")
+    p_sg.add_argument("ggf", help="the .gguf file")
+    p_sg.add_argument("--out", help="write to this path instead of <gguf>.share.tsv")
+    p_sg.add_argument("--force", action="store_true",
+                      help="overwrite an existing manifest whose gate no longer matches")
+    p_ss = share_sub.add_parser("status", help="query the registry: how much of a model is resident")
+    p_ss.add_argument("ggf")
+    p_ss.add_argument("--share-socket", help="registry socket (default $GGUF_DAG_SHARE_SOCKET)")
+    p_ss.add_argument("--share-bus", action="append",
+                      help="PCI bus id to query under (default: nvidia-smi probe)")
+    p_sw = share_sub.add_parser("warm", help="seed the registry pool for a model via llama-share-prewarm")
+    p_sw.add_argument("ggf")
+    p_sw.add_argument("--share-socket", help="registry socket (default $GGUF_DAG_SHARE_SOCKET)")
+    p_sw.add_argument("--share-manifest", help="use an existing manifest without generating")
+    p_sw.add_argument("--share-prewarm-bin", dest="share_prewarm_bin",
+                      help="llama-share-prewarm binary (default: deps/llama.cpp/build*/bin/llama-share-prewarm)")
 
     args = ap.parse_args(argv)
 
@@ -197,6 +333,9 @@ def main(argv=None):
             for note, cnt in sorted(notes.items()):
                 print(f"  note: {note} x{cnt}")
         return 0
+
+    if args.cmd == "share":
+        return {"gen": _share_cmd_gen, "status": _share_cmd_status, "warm": _share_cmd_warm}[args.share_cmd](args)
 
     ap.error(f"unknown command {args.cmd}")
 
