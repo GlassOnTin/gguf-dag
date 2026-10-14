@@ -17,6 +17,7 @@ from gguf_dag.ggml import payload_nbytes
 from gguf_dag.share import (MAGIC, VERSION, QUERY, ST_HIT, ST_MISS,
                             ShareError, RegistryClient, normalize_bus,
                             parse_share_manifest, render_share_manifest,
+                            expand_shards, ensure_manifest, file_state,
                             _digests_from_file, _digests_from_store)
 from gguf_dag.store import Store
 import util as gguf_util
@@ -117,6 +118,12 @@ class TestSizeTable(unittest.TestCase):
         # dims and published nbytes from a real qwen2.5-1.5B q8_0 tensor
         self.assertEqual(payload_nbytes([1536, 8960], 8), 14622720)
 
+    def test_iq4_nl_and_iq3_xxs_ground_truth(self):
+        # per_layer_token_embd.weight in Qwen3.8-Flash-Next-UD-Q4_K_XL (iq4_nl, type 20)
+        self.assertEqual(payload_nbytes([3840, 248320], 20), (3840 // 32) * 18 * 248320)
+        # iq3_xxs (type 18: 256-elem block, 98 bytes)
+        self.assertEqual(payload_nbytes([512, 64], 18), (512 // 256) * 98 * 64)
+
     def test_scalars(self):
         self.assertEqual(payload_nbytes([256, 1024], 0), 1048576)   # f32
         self.assertEqual(payload_nbytes([512], 1), 1024)             # f16
@@ -189,6 +196,23 @@ class TestDigests(unittest.TestCase):
         self.assertEqual([e[1] for e in entries], [hashlib.sha256(self.t1).hexdigest(),
                                                    hashlib.sha256(self.t2).hexdigest()])
         self.assertEqual(entries[0][2], len(self.t1))
+
+    def test_multi_shard_manifest(self):
+        # Shard 1: metadata only (0 tensors); Shard 2: t1 + t2
+        s1_blob = gguf_util.build_gguf(tensors=[])
+        with tempfile.TemporaryDirectory() as tmp:
+            s1 = Path(tmp) / "model-00001-of-00002.gguf"
+            s2 = Path(tmp) / "model-00002-of-00002.gguf"
+            s1.write_bytes(s1_blob)
+            s2.write_bytes(self.blob)
+            self.assertEqual(expand_shards(s1), [str(s1), str(s2)])
+            self.assertEqual(expand_shards(s2), [str(s1), str(s2)])
+            mpath, entries, _src = ensure_manifest(s1)
+            self.assertEqual(mpath, Path(str(s1) + ".share.tsv"))
+            self.assertEqual([e[0] for e in entries], ["t1", "t2"])
+            total, mtime, parsed = parse_share_manifest(mpath)
+            self.assertEqual((total, mtime), file_state([s1, s2]))
+            self.assertEqual(parsed, entries)
 
     def test_table_disagreement_raises(self):
         # dims claim 2048 f32 elements (8192 bytes) but the file holds less

@@ -13,7 +13,8 @@ from . import __version__
 from .dedupe import bind_file, fideduperange, ranges_for_pair
 from .share import (ShareError, RegistryClient, ensure_manifest, probe_buses,
                     normalize_bus, store_tensor_digests, fresh_publish_manifest,
-                    parse_share_manifest, file_state, default_manifest)
+                    parse_share_manifest, file_state, default_manifest,
+                    expand_shards)
 from .store import Store
 
 
@@ -47,6 +48,7 @@ def _share_manifest(args, gguf):
     one (flagging a stale gate), then the store digest cache — computing the
     cache is allowed but costs a full hash pass, which status notes.
     """
+    shards = expand_shards(gguf)
     fresh = fresh_publish_manifest(gguf)
     if fresh is not None:
         _t, _m, entries = parse_share_manifest(fresh)
@@ -55,17 +57,20 @@ def _share_manifest(args, gguf):
     if os.path.exists(gen):
         total, mtime, entries = parse_share_manifest(gen)
         note = ""
-        if (total, mtime) != file_state([gguf]):
+        if (total, mtime) != file_state(shards):
             note = " (stale gate: the file changed after generation)"
         return entries, f"generated manifest {os.path.basename(gen)}{note}"
     if os.path.exists(args.store):
         with Store(args.store, args.chunk) as st:
-            man = bind_file(st, gguf)
-            if man is not None:
-                entries = store_tensor_digests(st, man)
-                print(f"(no manifest yet; computing store digests for {man['id'][:12]}, "
+            mans = [bind_file(st, s) for s in shards]
+            if all(m is not None for m in mans):
+                entries = []
+                for m in mans:
+                    entries.extend(store_tensor_digests(st, m))
+                ids = ",".join(m["id"][:12] for m in mans)
+                print(f"(no manifest yet; computing store digests for {ids}, "
                       "cached afterwards)")
-                return entries, f"store manifest {man['id'][:12]}"
+                return entries, f"store manifest{'s' if len(mans) > 1 else ''} {ids}"
     raise ShareError(
         f"no share manifest for {gguf}: none next to the file, and the file is "
         "not in the store. Run 'gguf-dag share gen' or add it to the store first.")
@@ -145,11 +150,17 @@ def _share_cmd_warm(args):
         mpath = str(path)
         total = sum(b for _n, _d, b in entries)
         print(f"manifest {mpath}: {len(entries)} tensors, {total / 2**20:.1f} MiB — source: {source}")
+    shards = expand_shards(args.ggf)
     t0 = time.time()
-    r = subprocess.run([prewarm, socket_path, mpath, args.ggf])
-    print(f"prewarm exit {r.returncode} in {time.time() - t0:.2f}s "
-          f"({os.path.basename(args.ggf)}, socket {socket_path})")
-    return r.returncode
+    rc = 0
+    for s in shards:
+        r = subprocess.run([prewarm, socket_path, mpath, s])
+        if r.returncode != 0:
+            rc = r.returncode
+            break
+    print(f"prewarm exit {rc} in {time.time() - t0:.2f}s "
+          f"({os.path.basename(args.ggf)}, {len(shards)} shard(s), socket {socket_path})")
+    return rc
 
 
 def main(argv=None):

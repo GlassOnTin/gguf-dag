@@ -26,6 +26,7 @@ bus id trailing the query.
 
 import hashlib
 import os
+import re
 import shutil
 import socket
 import struct
@@ -36,6 +37,8 @@ from . import ggml
 from .gguf import GGUFFile, GGUFError
 from .store import Store
 from .dedupe import bind_file
+
+_SHARD_RE = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$")
 
 MAGIC = 0x50485347  # "GSHP"
 VERSION = 1
@@ -164,17 +167,38 @@ def file_state(paths):
     return total, mtime
 
 
+def expand_shards(path):
+    """Expand a split GGUF path ('...-00001-of-0000N.gguf') into all N shard paths.
+
+    Matches llama.cpp's loader: when every shard 1..N exists on disk, the model
+    spans the ordered list and the manifest sits next to shard 1
+    (<shard1>.share.tsv), gated on the sum of all shard sizes and max of all
+    shard mtimes.  Single-file GGUFs return [os.fspath(path)].
+    """
+    s = os.fspath(path)
+    m = _SHARD_RE.match(s)
+    if m:
+        prefix, idx_s, count_s = m.groups()
+        idx, count = int(idx_s, 10), int(count_s, 10)
+        if 1 <= idx <= count and count > 1:
+            shards = [f"{prefix}-{i:05d}-of-{count:05d}.gguf" for i in range(1, count + 1)]
+            if all(os.path.exists(p) for p in shards):
+                return shards
+    return [s]
+
+
 def default_manifest(path):
-    return Path(os.fspath(path) + ".share.tsv")
+    return Path(expand_shards(path)[0] + ".share.tsv")
 
 
 def fresh_publish_manifest(gguf_path, mpath=None):
     """Use the publish-run manifest next to the GGUF if its gate still matches."""
-    mpath = Path(mpath) if mpath else default_manifest(gguf_path)
+    shards = expand_shards(gguf_path)
+    mpath = Path(mpath) if mpath else Path(shards[0] + ".share.tsv")
     if not mpath.exists():
         return None
     total, mtime, _entries = parse_share_manifest(mpath)
-    if (total, mtime) == file_state([gguf_path]):
+    if (total, mtime) == file_state(shards):
         return mpath
     return None
 
@@ -279,43 +303,48 @@ def store_tensor_digests(store, man):
 
 
 def ensure_manifest(gguf_path, store_root=None, out=None, force=False):
-    """Produce a share manifest for one GGUF. Returns (path, entries, source).
+    """Produce a share manifest for one GGUF (or shard group). Returns (path, entries, source).
 
     Preference order: a fresh publish-run manifest next to the file (exact
-    loaded-tensor record); the store's chunk stream; the GGUF file itself.
-    All fresh generations render to <gguf>.share.tsv unless out is given,
+    loaded-tensor record); the store's chunk stream; the GGUF file(s) directly.
+    All fresh generations render to <shard1>.share.tsv unless out is given,
     because that is the path llama-server's --share-ipc reads by default.
 
     force=True permits overwriting a manifest next to the file that is NOT a
     fresh publish-run record (i.e. one whose gate no longer matches, meaning
     the file changed after whatever produced it).
     """
-    gguf_path = os.fspath(gguf_path)
-    mpath = Path(out) if out else default_manifest(gguf_path)
+    shards = expand_shards(gguf_path)
+    mpath = Path(out) if out else Path(shards[0] + ".share.tsv")
 
     fresh = fresh_publish_manifest(gguf_path) if out is None else None
     if fresh is not None and fresh == mpath:
         _total, _mtime, entries = parse_share_manifest(fresh)
         return fresh, entries, "publish-run manifest (fresh gate)"
 
-    man = None
+    entries = None
     if store_root is not None:
         with Store(store_root) as st:
-            man = bind_file(st, gguf_path)
-            if man is not None:
-                entries = store_tensor_digests(st, man)
-                source = f"store manifest {man['id'][:12]} "
+            mans = [bind_file(st, s) for s in shards]
+            if all(m is not None for m in mans):
+                entries = []
+                for m in mans:
+                    entries.extend(store_tensor_digests(st, m))
+                ids = ",".join(m["id"][:12] for m in mans)
+                source = f"store manifest{'s' if len(mans) > 1 else ''} {ids} "
                 source += f"({len(entries)} tensors incl. any the loader may skip)"
-    if man is None:
-        entries = _digests_from_file(gguf_path)
-        source = "GGUF file direct"
+    if entries is None:
+        entries = []
+        for s in shards:
+            entries.extend(_digests_from_file(s))
+        source = "GGUF file direct" if len(shards) == 1 else f"GGUF {len(shards)} shards direct"
 
     if mpath.exists() and force is False:
         raise ShareError(
             f"{mpath} already exists and is not a fresh publish-run record; "
             "the model file changed after it was written. Rerun with --force to "
             "overwrite, or delete it.")
-    total, mtime = file_state([gguf_path])
+    total, mtime = file_state(shards)
     _write_atomic(mpath, render_share_manifest(total, mtime, entries))
     return mpath, entries, source
 
